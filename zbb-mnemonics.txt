@@ -1,0 +1,10 @@
+    365 min
+     99 sext.h
+     99 maxu
+     71 sext.b
+     23 max
+     22 zext.h
+      7 andn
+      5 rori
+      2 minu
+      1 clz

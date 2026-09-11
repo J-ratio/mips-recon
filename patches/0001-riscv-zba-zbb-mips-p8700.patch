@@ -1,0 +1,240 @@
+diff --git a/.github/workflows/build-cross.yml b/.github/workflows/build-cross.yml
+index eef78b6..bcea210 100644
+--- a/.github/workflows/build-cross.yml
++++ b/.github/workflows/build-cross.yml
+@@ -315,3 +315,68 @@ jobs:
+                          -DCMAKE_TOOLCHAIN_FILE=${PWD}/cmake/riscv64-spacemit-linux-gnu-gcc.cmake
+ 
+           cmake --build build --config Release -j $(nproc)
++
++  ubuntu-24-riscv64-cpu-mips-p8700-cross:
++    runs-on: ubuntu-24.04
++
++    steps:
++      - uses: actions/checkout@v6
++
++      - name: Setup toolchain and emulator
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y --no-install-recommends \
++                  gcc-14-riscv64-linux-gnu \
++                  g++-14-riscv64-linux-gnu \
++                  qemu-user-static
++
++      - name: Build
++        run: |
++          # The P8700 is RV64GC_Zba_Zbb - no vector unit, no Zfh/Zvfh, and it
++          # provides Xmipscbop rather than Zicbop.
++          cmake -B build -DLLAMA_OPENSSL=OFF \
++                         -DCMAKE_BUILD_TYPE=Release \
++                         -DGGML_OPENMP=OFF \
++                         -DLLAMA_BUILD_EXAMPLES=OFF \
++                         -DLLAMA_BUILD_TOOLS=OFF \
++                         -DLLAMA_BUILD_TESTS=ON \
++                         -DGGML_RVV=OFF \
++                         -DGGML_RV_ZFH=OFF \
++                         -DGGML_RV_ZVFH=OFF \
++                         -DGGML_RV_ZICBOP=OFF \
++                         -DGGML_RV_ZBA=ON \
++                         -DGGML_RV_ZBB=ON \
++                         -DRISCV_TOOLCHAIN_SUFFIX=-14 \
++                         -DCMAKE_TOOLCHAIN_FILE=${PWD}/cmake/riscv64-mips-p8700-linux-gnu-gcc.cmake
++
++          cmake --build build --config Release -j $(nproc) \
++                  -t test-quantize-fns test-rope test-barrier
++
++      - name: Check Zbb codegen
++        run: |
++          # Fail loudly if -march never reached the compiler: the quantization
++          # hot paths must contain Zbb instructions.
++          CPU_LIB=$(find build -name 'libggml-cpu.*' -o -name '*ggml-cpu*.o' | head -n 1)
++          test -n "$CPU_LIB"
++          echo "disassembling $CPU_LIB"
++          riscv64-linux-gnu-objdump -d "$CPU_LIB" > /tmp/ggml-cpu.asm
++          ZBB=$(grep -cE '[[:space:]](min|max|minu|maxu|cpop|cpopw|clz|clzw|ctz|ctzw|sext\.b|sext\.h|zext\.h|andn|orn|xnor|rev8|orc\.b|rol|rolw|ror|rorw|rori|roriw)[[:space:]]' \
++                  /tmp/ggml-cpu.asm || true)
++          echo "Zbb instructions: $ZBB"
++          test "$ZBB" -gt 0
++
++      - name: Test
++        run: |
++          # QEMU >= 10 models the P8700 directly via `-cpu mips-p8700`; the
++          # runner image ships an older qemu, so spell out the same ISA instead.
++          #
++          # test-backend-ops is not useful here: its default mode skips the CPU
++          # backend when CPU is the only device, and `grad` mode does not finish
++          # in reasonable time under emulation. test-quantize-fns is the
++          # targeted check anyway - it covers the scalar vec_dot paths, which is
++          # where the Zbb codegen lands on a core without a vector unit.
++          export QEMU="qemu-riscv64-static -L /usr/riscv64-linux-gnu -cpu rv64,v=false,zba=true,zbb=true"
++          export LD_LIBRARY_PATH=${PWD}/build/bin
++          $QEMU ./build/bin/test-quantize-fns
++          $QEMU ./build/bin/test-rope
++          $QEMU ./build/bin/test-barrier
+diff --git a/cmake/riscv64-mips-p8700-linux-gnu-gcc.cmake b/cmake/riscv64-mips-p8700-linux-gnu-gcc.cmake
+new file mode 100644
+index 0000000..090456f
+--- /dev/null
++++ b/cmake/riscv64-mips-p8700-linux-gnu-gcc.cmake
+@@ -0,0 +1,48 @@
++# Toolchain file for the MIPS P8700, a RISC-V core implementing RV64GC_Zba_Zbb.
++#
++# The P8700 has no vector unit, so builds using this file must also pass
++# -DGGML_RVV=OFF (see docs/build.md).
++#
++# By default this uses the distribution cross toolchain (riscv64-linux-gnu-*).
++# Set RISCV_ROOT_PATH to use a standalone riscv64-unknown-linux-gnu toolchain
++# instead, e.g. one built with MIPS vendor extension support.
++
++set(CMAKE_SYSTEM_NAME Linux)
++set(CMAKE_SYSTEM_PROCESSOR riscv64)
++set(CMAKE_SYSTEM_VERSION 1)
++
++if (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(riscv)")
++    message(STATUS "HOST SYSTEM ${CMAKE_HOST_SYSTEM_PROCESSOR}")
++elseif (DEFINED ENV{RISCV_ROOT_PATH})
++    file(TO_CMAKE_PATH $ENV{RISCV_ROOT_PATH} RISCV_ROOT_PATH)
++    set(RISCV_ROOT_PATH ${RISCV_ROOT_PATH} CACHE STRING "root path to riscv toolchain")
++    set(CMAKE_C_COMPILER   ${RISCV_ROOT_PATH}/bin/riscv64-unknown-linux-gnu-gcc)
++    set(CMAKE_CXX_COMPILER ${RISCV_ROOT_PATH}/bin/riscv64-unknown-linux-gnu-g++)
++    set(CMAKE_STRIP        ${RISCV_ROOT_PATH}/bin/riscv64-unknown-linux-gnu-strip)
++    set(CMAKE_FIND_ROOT_PATH "${RISCV_ROOT_PATH}/riscv64-unknown-linux-gnu")
++    set(CMAKE_SYSROOT "${RISCV_ROOT_PATH}/sysroot")
++else()
++    set(RISCV_TOOLCHAIN_SUFFIX "" CACHE STRING "suffix of the riscv64-linux-gnu toolchain, e.g. -14")
++    set(CMAKE_C_COMPILER   riscv64-linux-gnu-gcc${RISCV_TOOLCHAIN_SUFFIX})
++    set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++${RISCV_TOOLCHAIN_SUFFIX})
++    set(CMAKE_STRIP        riscv64-linux-gnu-strip)
++    set(CMAKE_FIND_ROOT_PATH "/usr/lib/riscv64-linux-gnu")
++endif()
++
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
++
++# The MIPS vendor extensions (Xmipscmov, Xmipslsp, Xmipscbop) are documented by
++# LLVM as targeting the P8700 and are modelled by QEMU's `mips-p8700` CPU, but
++# are not accepted by every toolchain. Append them via MIPS_P8700_MARCH_EXTRA
++# when using a toolchain that supports them, e.g.
++#   -DMIPS_P8700_MARCH_EXTRA=_xmipscmov_xmipslsp_xmipscbop
++set(MIPS_P8700_MARCH_EXTRA "" CACHE STRING "extra -march components for the P8700")
++
++set(MIPS_P8700_MARCH "rv64gc_zba_zbb${MIPS_P8700_MARCH_EXTRA}")
++
++set(CMAKE_C_FLAGS   "-march=${MIPS_P8700_MARCH} -mabi=lp64d ${CMAKE_C_FLAGS}")
++set(CMAKE_CXX_FLAGS "-march=${MIPS_P8700_MARCH} -mabi=lp64d ${CMAKE_CXX_FLAGS}")
++set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -latomic")
+diff --git a/cmake/riscv64-spacemit-linux-gnu-gcc.cmake b/cmake/riscv64-spacemit-linux-gnu-gcc.cmake
+index faed7fb..c5df410 100644
+--- a/cmake/riscv64-spacemit-linux-gnu-gcc.cmake
++++ b/cmake/riscv64-spacemit-linux-gnu-gcc.cmake
+@@ -24,6 +24,6 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+-set(CMAKE_C_FLAGS "-march=rv64gcv_zfh_zvfh_zba_zicbop -mabi=lp64d -fno-tree-vectorize -fno-tree-loop-vectorize ${CMAKE_C_FLAGS}")
+-set(CMAKE_CXX_FLAGS "-march=rv64gcv_zfh_zvfh_zba_zicbop -mabi=lp64d -fno-tree-vectorize -fno-tree-loop-vectorize ${CMAKE_CXX_FLAGS}")
++set(CMAKE_C_FLAGS "-march=rv64gcv_zfh_zvfh_zba_zbb_zicbop -mabi=lp64d -fno-tree-vectorize -fno-tree-loop-vectorize ${CMAKE_C_FLAGS}")
++set(CMAKE_CXX_FLAGS "-march=rv64gcv_zfh_zvfh_zba_zbb_zicbop -mabi=lp64d -fno-tree-vectorize -fno-tree-loop-vectorize ${CMAKE_CXX_FLAGS}")
+ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -latomic")
+diff --git a/docs/build.md b/docs/build.md
+index ca086a0..6dc0196 100644
+--- a/docs/build.md
++++ b/docs/build.md
+@@ -748,6 +748,68 @@ Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/m
+ 
+ To read documentation for how to build on IBM Z & LinuxONE, [click here](./build-s390x.md)
+ 
++## RISC-V
++
++The riscv64 CPU backend selects its `-march` string from the following options. All
++of them are ignored unless the target is riscv64, and all are ignored when
++`GGML_CPU_ALL_VARIANTS` is enabled.
++
++| Option | Default | Notes |
++| --- | --- | --- |
++| `GGML_RVV` | `ON` | Vector extension (RVV 1.0). Turn `OFF` for cores without a vector unit. |
++| `GGML_RV_ZFH` | `ON` | Scalar half-precision floating point. |
++| `GGML_RV_ZVFH` | `ON` | Vector half-precision floating point. Requires `GGML_RVV`. |
++| `GGML_RV_ZVFBFWMA` | `OFF` | Vector BF16 widening multiply-add. Requires `GGML_RVV`. |
++| `GGML_RV_ZICBOP` | `ON` | Cache block prefetch. |
++| `GGML_RV_ZIHINTPAUSE` | `ON` | `pause` hint. |
++| `GGML_RV_ZBA` | `ON` | Address generation. Part of the RVA22/RVA23 baseline. |
++| `GGML_RV_ZBB` | `ON` | Basic bit manipulation. Part of the RVA22/RVA23 baseline. |
++| `GGML_XTHEADVECTOR` | `OFF` | T-Head vector extension, used instead of RVV 1.0. |
++
++The defaults target a current RVA23-class core. For older or narrower hardware,
++turn off whatever the core does not implement — executing an instruction from an
++unimplemented extension traps.
++
++### SpacemiT
++
++Cores implementing the SpacemiT IME matrix extension (e.g. the K1) can use
++hand-written matrix kernels via `-DGGML_CPU_RISCV64_SPACEMIT=ON`, together with
++`cmake/riscv64-spacemit-linux-gnu-gcc.cmake` and the vendor toolchain in
++`RISCV_ROOT_PATH`.
++
++### MIPS P8700
++
++The P8700 implements `RV64GC_Zba_Zbb`. It has no vector unit, no half-precision
++floating point, and provides `Xmipscbop` rather than `Zicbop`, so those options
++must be turned off:
++
++```sh
++cmake -B build \
++    -DGGML_RVV=OFF \
++    -DGGML_RV_ZFH=OFF \
++    -DGGML_RV_ZVFH=OFF \
++    -DGGML_RV_ZICBOP=OFF \
++    -DGGML_RV_ZBA=ON \
++    -DGGML_RV_ZBB=ON \
++    -DCMAKE_TOOLCHAIN_FILE=$PWD/cmake/riscv64-mips-p8700-linux-gnu-gcc.cmake
++cmake --build build --config Release -j $(nproc)
++```
++
++The toolchain file uses the distribution cross compiler by default; set
++`RISCV_TOOLCHAIN_SUFFIX` to pick a specific version (e.g. `-14`), or set the
++`RISCV_ROOT_PATH` environment variable to use a standalone toolchain.
++
++The MIPS vendor extensions (`Xmipscmov`, `Xmipslsp`, `Xmipscbop`) are not part of
++the default `-march`, since not every toolchain accepts them. Add them with
++`-DMIPS_P8700_MARCH_EXTRA=_xmipscmov_xmipslsp_xmipscbop` on a toolchain that does.
++
++QEMU 10 and later model this core directly, which is enough to run the test
++suite without hardware:
++
++```sh
++qemu-riscv64 -L /usr/riscv64-linux-gnu -cpu mips-p8700 ./build/bin/test-backend-ops
++```
++
+ ## OpenVINO
+ 
+ [OpenVINO](https://docs.openvino.ai/) is an open-source toolkit for optimizing and deploying high-performance AI inference, specifically designed for Intel hardware (CPUs, GPUs, and NPUs).
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 6c7337e..698671b 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -176,6 +176,8 @@ option(GGML_RV_ZFH           "ggml: enable riscv zfh"         ON)
+ option(GGML_RV_ZVFH          "ggml: enable riscv zvfh"        ON)
+ option(GGML_RV_ZICBOP        "ggml: enable riscv zicbop"      ON)
+ option(GGML_RV_ZIHINTPAUSE   "ggml: enable riscv zihintpause" ON)
++option(GGML_RV_ZBA           "ggml: enable riscv zba"         ON)
++option(GGML_RV_ZBB           "ggml: enable riscv zbb"         ON)
+ option(GGML_RV_ZVFBFWMA      "ggml: enable riscv zvfbfwma"    OFF)
+ option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"      OFF)
+ option(GGML_VXE              "ggml: enable vxe"               ${GGML_NATIVE})
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index 836bae4..088dd3d 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -490,6 +490,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+             if (GGML_RV_ZBA)
+                 string(APPEND MARCH_STR "_zba")
+             endif()
++            if (GGML_RV_ZBB)
++                string(APPEND MARCH_STR "_zbb")
++            endif()
+             if (GGML_CPU_RISCV64_SPACEMIT)
+                 # `xsmtvdotii' is only required for GCC >= 15.
+                 if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND
